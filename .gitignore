@@ -13,3 +13,4 @@ htmlcov/
 .env.secret
 !.env.example
 logs/
+.ruff_cache/
