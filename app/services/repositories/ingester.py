@@ -5,7 +5,6 @@ from sqlalchemy import select as sa_select
 
 from app.config import get_settings
 from app.infra.db.postgres import get_session, Source
-from app.services.documents.processor import get_document_processor
 from app.services.client import get_service_client
 from app.router import get_router
 from app.models import FileType
@@ -266,26 +265,16 @@ async def sync_git_repo_api(
                     source_id_str = str(repo_record.id) if repo_record else source_id
                     file_type = router.detect_file_type(clean_path)
 
-                    if file_type == FileType.CODE:
-                        payload = {
-                            "content": content if isinstance(content, str) else content.decode("utf-8", errors="replace"),
-                            "filename": clean_path,
-                            "source_id": source_id_str,
-                            "user_id": user_id_str,
-                            "is_base64": False
-                        }
-                        await client.send_to_processor_http(
-                            endpoint="/api/v1/process", payload=payload, timeout=60.0
-                        )
-                    else:
-                        await get_document_processor().process_document(
-                            source_id=source_id_str,
-                            file_id=str(uuid.uuid4()),
-                            filename=clean_path,
-                            content=content if isinstance(content, bytes) else content.encode("utf-8"),
-                            metadata={"provider": provider, "url": uri},
-                            user_id=user_id_str,
-                        )
+                    payload = {
+                        "content": content if isinstance(content, str) else content.decode("utf-8", errors="replace"),
+                        "filename": clean_path,
+                        "source_id": source_id_str,
+                        "user_id": user_id_str,
+                        "is_base64": False
+                    }
+                    await client.send_to_processor_http(
+                        endpoint="/api/v1/process", payload=payload, timeout=60.0
+                    )
 
             except Exception as e:
                 logger.error("Failed to stream generic file", provider=provider, error=str(e))

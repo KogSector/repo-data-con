@@ -186,12 +186,6 @@ async def create_source(
             "github",
             "gitlab",
             "bitbucket",
-            "google-drive",
-            "onedrive",
-            "gdrive",
-            "dropbox",
-            "slack",
-            "notion",
             "custom",
         ]
         if not request.credentials and request.type in providers_needing_tokens:
@@ -202,11 +196,7 @@ async def create_source(
             try:
                 # Map source type to the provider name stored in auth-middleware
                 provider_name = request.type.value
-                if provider_name == "gdrive":
-                    provider_name = "google"
-                elif provider_name == "google-drive":
-                    provider_name = "google"
-                elif provider_name == "custom":
+                if provider_name == "custom":
                     provider_name = "custom_apps"
 
                 tokens = await client.get_auth_token(user_id, provider_name)
