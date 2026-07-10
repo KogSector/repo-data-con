@@ -21,9 +21,6 @@ class Topics:
     # Consumer: unified-processor
     EMBEDDING_GENERATED = "embedding.generated"
 
-    # Graphify Episodes (data-connector → graphify-pipeline)
-    # Producer: data-connector
-    GRAPHIFY_EPISODES = "graph.episodes"
 
     # Event-Driven Pipeline Topics (repo event pipeline)
     REPO_EVENTS = "repo.events"
@@ -34,6 +31,5 @@ class Topics:
         return [
             cls.CHUNKS_RAW,
             cls.EMBEDDING_GENERATED,
-            cls.GRAPHIFY_EPISODES,
             cls.REPO_EVENTS,
         ]
