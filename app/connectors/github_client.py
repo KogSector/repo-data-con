@@ -69,6 +69,7 @@ class GitHubConnector(BaseConnector, GitProviderMixin):
         )
         # We will dynamically create a client per user/repo based on their OAuth token
         self._user_client: Optional[Github] = None
+        self._github = None
 
     def get_auth_url(self, state: Optional[str] = None, redirect_uri: Optional[str] = None) -> str:
         """

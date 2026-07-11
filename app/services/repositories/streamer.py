@@ -356,7 +356,7 @@ class RepoStreamer:
                     "is_base64": False
                 }
                 await self.client.send_to_processor_http(
-                    endpoint="/api/v1/process", payload=payload, timeout=60.0
+                    endpoint="/api/v1/codebase/analyze", payload=payload, timeout=60.0
                 )
                 return
 

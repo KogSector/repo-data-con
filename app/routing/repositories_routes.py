@@ -547,10 +547,17 @@ async def create_repository(
         print("DEBUG: Entered async with get_session()")
         # Check for existing repo with same URL to prevent duplicates for this user
         normalized_url = (payload.url or "").rstrip("/").rstrip(".git").lower()
-        existing = await session.execute(
-            select(Repository).where(Repository.url == payload.url, Repository.user_id == user_id)
+        
+        # Fetch all user repos to check for a normalized URL match
+        user_repos = await session.execute(
+            select(Repository).where(Repository.user_id == user_id)
         )
-        existing_repo = existing.scalars().first()
+        existing_repo = None
+        for r in user_repos.scalars().all():
+            if (r.url or "").rstrip("/").rstrip(".git").lower() == normalized_url:
+                existing_repo = r
+                break
+                
         print(f"DEBUG: existing_repo = {existing_repo}")
         if existing_repo:
             logger.warning(

@@ -102,6 +102,8 @@ async def sync_git_repo_api(
 
         # Use fetch_source to get the tree and download files in memory
         provided_credentials = credentials or {}
+        if provided_credentials.get("access_token"):
+            connector.set_credentials(provided_credentials["access_token"])
 
         # Determine latest commit
         latest_commit = None
@@ -273,7 +275,7 @@ async def sync_git_repo_api(
                         "is_base64": False
                     }
                     await client.send_to_processor_http(
-                        endpoint="/api/v1/process", payload=payload, timeout=60.0
+                        endpoint="/api/v1/codebase/analyze", payload=payload, timeout=60.0
                     )
 
             except Exception as e:
