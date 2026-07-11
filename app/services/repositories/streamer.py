@@ -300,11 +300,46 @@ class RepoStreamer:
                 producer.flush()
 
             # Update repository status to active
+            import uuid
             async with get_session() as session:
-                repo = await session.get(Repository, repo_id)
+                try:
+                    rid = uuid.UUID(repo_id)
+                except ValueError:
+                    rid = repo_id
+                
+                repo = await session.get(Repository, rid)
                 if repo:
                     repo.status = "active"
                     await session.commit()
+                    
+                    # Create Repository node in FalkorDB
+                    try:
+                        import redis.asyncio as redis
+                        from app.config import get_settings
+                        settings = get_settings()
+                        if settings.falkordb_host:
+                            client = redis.Redis(
+                                host=settings.falkordb_host,
+                                port=settings.falkordb_port,
+                                username=settings.falkordb_username,
+                                password=settings.falkordb_password,
+                                decode_responses=True,
+                                ssl=False,
+                            )
+                            user_id_esc = user_id.replace('"', '\\"')
+                            repo_name_esc = repo.name.replace('"', '\\"')
+                            repo_url_esc = repo.url.replace('"', '\\"')
+                            provider_esc = repo.provider.replace('"', '\\"')
+                            
+                            cypher = f"""
+                            MERGE (r:Repository {{id: "{repo_id}"}})
+                            ON CREATE SET r.owner_id = "{user_id_esc}", r.name = "{repo_name_esc}", r.url = "{repo_url_esc}", r.provider = "{provider_esc}"
+                            """
+                            await client.execute_command("GRAPH.QUERY", f"graph-{user_id}", cypher)
+                            await client.aclose()
+                            logger.info("[REPO-STREAMER] Created Repository node in FalkorDB", repo_id=repo_id)
+                    except Exception as db_err:
+                        logger.warning("Failed to create Repository node in FalkorDB", error=str(db_err))
 
             logger.info("[REPO-STREAMER] Successfully streamed repository, triggering cross-file graph sync", repo_id=repo_id)
             try:
@@ -328,7 +363,13 @@ class RepoStreamer:
                 "[REPO-STREAMER] Failed to stream repository", repo_id=repo_id, error=str(e)
             )
             async with get_session() as session:
-                repo = await session.get(Repository, repo_id)
+                try:
+                    import uuid
+                    rid = uuid.UUID(repo_id)
+                except Exception:
+                    rid = repo_id
+                    
+                repo = await session.get(Repository, rid)
                 if repo:
                     repo.status = "sync_failed"
                     await session.commit()
