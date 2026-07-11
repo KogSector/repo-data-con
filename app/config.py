@@ -5,6 +5,8 @@ Data Connector Service - Configuration
 from functools import lru_cache
 from pydantic_settings import BaseSettings
 from pydantic import Field, validator
+import tempfile
+import os
 
 
 class Settings(BaseSettings):
@@ -105,7 +107,6 @@ class Settings(BaseSettings):
         return v
 
     # Downloads folder configuration
-    downloads_folder: str = Field(alias="DOWNLOADS_BASE_PATH")
 
     # Kafka Configuration
     kafka_bootstrap_servers: str = Field(alias="KAFKA_BOOTSTRAP_SERVERS")
