@@ -160,7 +160,7 @@ async def get_status():
 # =============================================================================
 
 
-@router.post("/api/v1/sources", response_model=SourceResponse)
+@router.post("/api/sources", response_model=SourceResponse)
 async def create_source(
     request: SourceCreateRequest, http_request: Request, background_tasks: BackgroundTasks
 ):
@@ -371,7 +371,7 @@ async def create_source(
         )
 
 
-@router.get("/api/v1/sources")
+@router.get("/api/sources")
 async def list_sources(
     http_request: Request, type: SourceType | None = None, limit: int = 50, offset: int = 0
 ):
@@ -408,7 +408,7 @@ async def list_sources(
         }
 
 
-@router.get("/api/v1/sources/{source_id}")
+@router.get("/api/sources/{source_id}")
 async def get_source(source_id: str, http_request: Request):
     """Get a specific source by ID."""
     user_id = http_request.headers.get("x-user-id")
@@ -440,7 +440,7 @@ async def get_source(source_id: str, http_request: Request):
         }
 
 
-@router.delete("/api/v1/sources/{source_id}")
+@router.delete("/api/sources/{source_id}")
 async def delete_source(source_id: str, http_request: Request):
     """Delete a data source."""
     user_id = http_request.headers.get("x-user-id")
@@ -481,7 +481,7 @@ async def delete_source(source_id: str, http_request: Request):
         return {"success": True, "message": "Source deleted successfully"}
 
 
-@router.post("/api/v1/sources/{source_id}/sync")
+@router.post("/api/sources/{source_id}/sync")
 async def sync_source_endpoint(source_id: str, background_tasks: BackgroundTasks):
     """Trigger a manual sync for a source."""
     return await start_ingestion(IngestRequest(source_id=source_id), background_tasks)
