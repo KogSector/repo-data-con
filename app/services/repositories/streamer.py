@@ -33,7 +33,7 @@ class RepoStreamer:
         url = url.rstrip("/")
 
         if provider == "github":
-            match = re.search(r"github\.com/([^/]+/[^/]+?)(?:/tree/[^/]+/(.+))?$", url)
+            match = re.search(r"github\.com/([^/]+/[^/]+?)(?:/tree/[^/]+/(.+?))?(?:\?.*)?$", url)
             if match:
                 repo_id = match.group(1)
                 if repo_id.endswith(".git"):

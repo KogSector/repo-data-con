@@ -92,13 +92,11 @@ async def sync_git_repo_api(
 
         branch = repo_record.branch if repo_record else "main"
 
-        # Parse the URI to get the owner/repo path (e.g., from https://github.com/mvp-2003/Proposal -> mvp-2003/Proposal)
-        import urllib.parse
-
-        parsed_uri = urllib.parse.urlparse(uri)
-        repo_path = parsed_uri.path.strip("/")
-        if repo_path.endswith(".git"):
-            repo_path = repo_path[:-4]
+        # Parse the URI to get the owner/repo path and any nested folder
+        from app.services.repositories.streamer import RepoStreamer
+        streamer = RepoStreamer()
+        repo_id, folder_path = streamer._parse_repo_url(uri, provider)
+        repo_path = repo_id
 
         # Use fetch_source to get the tree and download files in memory
         provided_credentials = credentials or {}
@@ -177,11 +175,18 @@ async def sync_git_repo_api(
 
         old_access_token = provided_credentials.get("access_token")
 
+        include_patterns = metadata.get("include_patterns", ["**/*"])
+        if folder_path:
+            # If the user specified a nested folder, limit download to that folder.
+            if "**/*" in include_patterns:
+                include_patterns.remove("**/*")
+            include_patterns.append(f"{folder_path}/**/*")
+
         files_processed, total_size = await connector.fetch_source(
             uri=repo_path,
             credentials=provided_credentials,
             branch=branch,
-            include_patterns=metadata.get("include_patterns", ["**/*"]),
+            include_patterns=include_patterns,
             exclude_patterns=metadata.get("exclude_patterns", []),
         )
 
