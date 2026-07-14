@@ -212,9 +212,6 @@ async def fetch_branches(payload: FetchBranchesRequest):
 
             try:
                 import asyncio
-
-                # PyGithub calls are synchronous/blocking — run them off
-                # the event loop so they don't stall other requests.
                 from typing import Any
 
                 def _fetch(*args: Any, **kwargs: Any) -> tuple[list[str], str]:
@@ -230,11 +227,35 @@ async def fetch_branches(payload: FetchBranchesRequest):
                     "data": {
                         "branches": branches,
                         "default_branch": default_branch,
-                        "file_extensions": [],  # populated lazily if needed later
+                        "file_extensions": [],
                     },
                 }
             except Exception as e:
                 logger.error("Failed to fetch branches from GitHub", repo=repo_name, error=str(e))
+                # Attempt unauthenticated fallback for SAML SSO/OAuth restricted repos
+                if "OAuth App access restrictions" in str(e) or (hasattr(e, "status") and e.status == 403):
+                    try:
+                        logger.info("Retrying fetch branches without token due to OAuth restrictions", repo=repo_name)
+                        def _fetch_anon(*args: Any, **kwargs: Any) -> tuple[list[str], str]:
+                            anon_gh = Github()
+                            repo = anon_gh.get_repo(repo_name)
+                            branches = [b.name for b in repo.get_branches()]
+                            default_branch = getattr(repo, "default_branch", "main")
+                            return branches, default_branch
+                            
+                        branches, default_branch = await asyncio.to_thread(_fetch_anon)
+                        return {
+                            "success": True,
+                            "data": {
+                                "branches": branches,
+                                "default_branch": default_branch,
+                                "file_extensions": [],
+                                "token_restricted": True
+                            },
+                        }
+                    except Exception as anon_e:
+                        logger.error("Unauthenticated fallback failed", repo=repo_name, error=str(anon_e))
+
                 if "404" in str(e) or "Not Found" in str(e):
                     return {
                         "success": False,
