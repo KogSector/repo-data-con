@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     # Service configuration
     service_name: str = "data-connector"
-    port: int = Field(alias="DATA_CONNECTOR_PORT")
+    port: int = Field(alias="REPO_DATA_CON_PORT")
     host: str = Field(alias="HOST")
     debug: bool = Field(alias="DEBUG")
 
@@ -38,17 +38,6 @@ class Settings(BaseSettings):
 
 
 
-    # Google Drive Connector
-    google_client_id: str | None = Field(default=None, alias="GOOGLE_CLIENT_ID")
-    google_client_secret: str | None = Field(default=None, alias="GOOGLE_CLIENT_SECRET")
-    google_redirect_uri: str | None = Field(default=None, alias="GOOGLE_REDIRECT_URI")
-
-    # Notion Connector
-    notion_api_key: str | None = Field(default=None, alias="NOTION_API_KEY")
-    notion_client_id: str | None = Field(default=None, alias="NOTION_CLIENT_ID")
-    notion_client_secret: str | None = Field(default=None, alias="NOTION_CLIENT_SECRET")
-    notion_redirect_uri: str | None = Field(default=None, alias="NOTION_REDIRECT_URI")
-
     # GitHub OAuth
     github_client_id: str | None = Field(default=None, alias="GITHUB_CLIENT_ID")
     github_client_secret: str | None = Field(default=None, alias="GITHUB_CLIENT_SECRET")
@@ -64,14 +53,7 @@ class Settings(BaseSettings):
     bitbucket_client_id: str | None = Field(default=None, alias="BITBUCKET_CLIENT_ID")
     bitbucket_client_secret: str | None = Field(default=None, alias="BITBUCKET_CLIENT_SECRET")
 
-    # Microsoft OAuth (OneDrive/SharePoint)
-    microsoft_client_id: str | None = Field(default=None, alias="MICROSOFT_CLIENT_ID")
-    microsoft_client_secret: str | None = Field(default=None, alias="MICROSOFT_CLIENT_SECRET")
-    microsoft_tenant_id: str | None = Field(default=None, alias="MICROSOFT_TENANT_ID")
 
-    # Dropbox OAuth
-    dropbox_client_id: str | None = Field(default=None, alias="DROPBOX_CLIENT_ID")
-    dropbox_client_secret: str | None = Field(default=None, alias="DROPBOX_CLIENT_SECRET")
 
     # Security
     encryption_key: str = Field(
