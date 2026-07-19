@@ -249,6 +249,11 @@ async def sync_git_repo_api(
         router = get_router()
         client = get_service_client()
 
+        consecutive_failures = 0
+        max_consecutive_failures = 5
+        files_sent = 0
+        files_failed = 0
+
         for file_info in files_processed:
             try:
                 clean_path = (
@@ -282,9 +287,40 @@ async def sync_git_repo_api(
                     await client.send_to_processor_http(
                         endpoint="/api/v1/codebase/analyze", payload=payload, timeout=60.0
                     )
+                    files_sent += 1
+                    consecutive_failures = 0  # Reset on success
 
             except Exception as e:
-                logger.error("Failed to stream generic file", provider=provider, error=str(e))
+                files_failed += 1
+                consecutive_failures += 1
+                logger.error(
+                    "Failed to stream generic file",
+                    provider=provider,
+                    error=str(e),
+                    consecutive_failures=consecutive_failures,
+                )
+
+                if consecutive_failures >= max_consecutive_failures:
+                    remaining = len(files_processed) - files_sent - files_failed
+                    logger.error(
+                        "[CIRCUIT-BREAKER] Aborting file stream — unified-processor appears down",
+                        provider=provider,
+                        source_id=source_id,
+                        files_sent=files_sent,
+                        files_failed=files_failed,
+                        files_remaining=remaining,
+                        max_consecutive_failures=max_consecutive_failures,
+                    )
+                    break
+
+        logger.info(
+            "[SYNC] File streaming completed",
+            source_id=source_id,
+            provider=provider,
+            files_sent=files_sent,
+            files_failed=files_failed,
+            total_files=len(files_processed),
+        )
 
         return True
 
