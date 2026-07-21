@@ -255,6 +255,29 @@ class ServiceClient:
                     status_code=504,
                     detail=f"Unified-processor request timed out after {max_retries} attempts",
                 )
+            except (httpx.RequestError, httpx.HTTPError) as e:
+                last_exception = e
+                if attempt < max_retries:
+                    backoff = min(2 ** (attempt - 1), 8)
+                    logger.warning(
+                        "[SERVICE-CLIENT] Request/Protocol error communicating with unified-processor, retrying",
+                        url=url,
+                        attempt=attempt,
+                        backoff_seconds=backoff,
+                        error=str(e),
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                logger.error(
+                    "[SERVICE-CLIENT] Request/Protocol error with unified-processor after retries",
+                    url=url,
+                    attempts=max_retries,
+                    error=str(e),
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Unified-processor protocol/network error at {base_url} after {max_retries} attempts: {str(e)}",
+                )
 
         # Should not be reached, but safeguard
         raise HTTPException(
