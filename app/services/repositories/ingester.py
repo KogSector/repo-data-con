@@ -249,6 +249,9 @@ async def sync_git_repo_api(
         router = get_router()
         client = get_service_client()
 
+        # Warm up downstream unified-processor service to handle potential cold starts (e.g. Render spin-up)
+        await client.ensure_service_ready("repo-uni-proc", max_wait_seconds=30)
+
         consecutive_failures = 0
         max_consecutive_failures = 5
         files_sent = 0

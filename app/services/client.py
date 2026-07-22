@@ -116,13 +116,53 @@ class ServiceClient:
         except Exception:
             return False
 
+    async def ensure_service_ready(self, service: str = "repo-uni-proc", max_wait_seconds: int = 30) -> bool:
+        """
+        Wait for a downstream service to wake up (e.g. Render cold start) and be ready.
+
+        Args:
+            service: Name of the downstream service
+            max_wait_seconds: Maximum time to wait for readiness in seconds
+
+        Returns:
+            True if service is responsive, False if timed out
+        """
+        import asyncio
+        try:
+            import httpx
+        except ImportError:
+            return False
+
+        url_map = {
+            "repo-uni-proc": self.settings.repo_uni_proc_url,
+        }
+        base_url = url_map.get(service)
+        if not base_url:
+            return False
+
+        start_time = asyncio.get_event_loop().time()
+        attempt = 0
+        while (asyncio.get_event_loop().time() - start_time) < max_wait_seconds:
+            attempt += 1
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(f"{base_url}/health")
+                    if response.status_code == 200:
+                        logger.info(f"[SERVICE-CLIENT] Downstream service {service} is ready (attempt {attempt})")
+                        return True
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+        logger.warning(f"[SERVICE-CLIENT] Timed out waiting for {service} to become ready after {max_wait_seconds}s")
+        return False
+
     async def send_to_processor_http(
         self,
         endpoint: str,
         payload: dict,
         timeout: float = 60.0,
         headers: dict | None = None,
-        max_retries: int = 3,
+        max_retries: int = 5,
     ) -> dict:
         """
         Forward data to unified-processor via internal HTTP POST.
@@ -143,7 +183,7 @@ class ServiceClient:
             payload: JSON-serialisable dictionary
             timeout: HTTP timeout in seconds (default 60s)
             headers: Optional dictionary of HTTP headers to include
-            max_retries: Max retry attempts for transient errors (default 3)
+            max_retries: Max retry attempts for transient errors (default 5)
 
         Returns:
             Parsed JSON response from unified-processor
@@ -186,7 +226,7 @@ class ServiceClient:
 
                     # Retryable server error — back off and retry
                     if response.status_code in retryable_statuses and attempt < max_retries:
-                        backoff = min(2 ** (attempt - 1), 8)  # 1s, 2s, 4s, capped at 8s
+                        backoff = min(2 ** (attempt - 1), 10)  # 1s, 2s, 4s, 8s, capped at 10s
                         logger.warning(
                             "[SERVICE-CLIENT] Transient error from unified-processor, retrying",
                             status_code=response.status_code,
