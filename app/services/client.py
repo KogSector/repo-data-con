@@ -116,7 +116,7 @@ class ServiceClient:
         except Exception:
             return False
 
-    async def ensure_service_ready(self, service: str = "repo-uni-proc", max_wait_seconds: int = 30) -> bool:
+    async def ensure_service_ready(self, service: str = "repo-uni-proc", max_wait_seconds: int = 60) -> bool:
         """
         Wait for a downstream service to wake up (e.g. Render cold start) and be ready.
 
@@ -162,7 +162,7 @@ class ServiceClient:
         payload: dict,
         timeout: float = 60.0,
         headers: dict | None = None,
-        max_retries: int = 5,
+        max_retries: int = 8,
     ) -> dict:
         """
         Forward data to unified-processor via internal HTTP POST.
