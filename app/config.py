@@ -99,8 +99,6 @@ class Settings(BaseSettings):
     kafka_ssl_ca_pem: str | None = Field(default=None, alias="KAFKA_SSL_CA_PEM")
     kafka_enable_idempotence: bool = Field(alias="KAFKA_ENABLE_IDEMPOTENCE", default=True)
 
-    environment: str = Field(alias="ENVIRONMENT")
-
     # FalkorDB Configuration
     falkordb_host: str = Field(
         alias="FALKORDB_HOST",
