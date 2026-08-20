@@ -96,6 +96,28 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Repo update consumer failed to initialize/start", error=str(e))
         app.state.repo_update_consumer = None
+
+    # --- Unified Processor Keep-Alive ---
+    # Keep repo-uni-proc active by pinging it every 4 minutes
+    # This prevents Render free tier spin-down
+    async def keepalive_repo_uni_proc():
+        import httpx
+        processor_url = os.getenv("REPO_UNI_PROC_URL", "http://repo-uni-proc:8090")
+        
+        while True:
+            await asyncio.sleep(240)  # 4 minutes
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(f"{processor_url}/health")
+                    if response.status_code == 200:
+                        logger.debug(f"Keep-alive ping successful for repo-uni-proc")
+            except Exception as e:
+                logger.warning(f"Keep-alive ping failed for repo-uni-proc: {e}")
+
+    import os
+    asyncio.create_task(keepalive_repo_uni_proc())
+    logger.info("repo-uni-proc keep-alive task started")
+
     logger.info("Application startup complete")
     yield
 
