@@ -615,6 +615,25 @@ async def create_repository(
             await session.refresh(repo)
             logger.info("[REPO-CREATE] Repository created successfully", repo_id=str(repo.id))
 
+            # Update billing count
+            try:
+                from app.services.client import get_service_client
+                client = get_service_client()
+                user_id_str = repo.user_id if repo.user_id else "system"
+                # Call billing API to increment repo count
+                import httpx
+                settings = get_settings()
+                async with httpx.AsyncClient() as http_client:
+                    await http_client.post(
+                        f"{settings.auth_url}/billing/internal/update-repo-count",
+                        json={"userId": user_id_str, "delta": 1},
+                        headers={"X-API-Key": settings.internal_api_key},
+                        timeout=10.0
+                    )
+                logger.info("[REPO-CREATE] Updated billing repo count", user_id=user_id_str)
+            except Exception as e:
+                logger.warning("[REPO-CREATE] Failed to update billing count", error=str(e))
+
         # Get credentials if source_id is provided
         access_token = None
         credentials = {}
@@ -886,6 +905,22 @@ async def delete_repository(repo_id: str):
             await session.execute(stmt)
 
         await session.commit()
+
+        # Update billing count
+        try:
+            import httpx
+            settings = get_settings()
+            user_id_str = repo_obj.user_id if repo_obj.user_id else "system"
+            async with httpx.AsyncClient() as http_client:
+                await http_client.post(
+                    f"{settings.auth_url}/billing/internal/update-repo-count",
+                    json={"userId": user_id_str, "delta": -1},
+                    headers={"X-API-Key": settings.internal_api_key},
+                    timeout=10.0
+                )
+            logger.info("[REPO-DELETE] Updated billing repo count", user_id=user_id_str)
+        except Exception as e:
+            logger.warning("[REPO-DELETE] Failed to update billing count", error=str(e))
 
         # Trigger downstream graph cleanup
         from app.services.client import get_service_client
