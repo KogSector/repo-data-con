@@ -668,23 +668,40 @@ class GitHubConnector(BaseConnector, GitProviderMixin):
         files_to_download = []
         total_size: int = 0
 
+        default_excluded = [
+            "*/.git/*", "*/__pycache__/*", "*.pyc", "*.pyo", "*.pyd",
+            "*/node_modules/*", "*/.venv/*", "*/venv/*", "*/dist/*", "*/build/*",
+            "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.pdf",
+            "*.zip", "*.tar", "*.gz", "*.7z", "*.rar",
+            "*.exe", "*.dll", "*.so", "*.dylib", "*.bin", "*.whl",
+            "*.class", "*.jar", "*.o", "*.a",
+            "*.mp4", "*.mp3", "*.wav", "*.ttf", "*.woff", "*.woff2", "*.eot"
+        ]
+        all_exclude_patterns = list(exclude_patterns) + default_excluded
+
         for item in tree:
             if item["type"] != "blob":
                 continue
 
             path = item["path"]
+            clean_path = path.lstrip("/")
+
+            # Check common junk directory components directly
+            parts = clean_path.split("/")
+            if any(p in {"__pycache__", ".git", "node_modules", ".venv", "venv", ".pytest_cache", ".mypy_cache"} for p in parts):
+                continue
 
             def match_pattern(path_str: str, pattern: str) -> bool:
                 if pattern == "**/*" or pattern == "*":
                     return True
                 pat = pattern.replace("**/*", "*").replace("**", "*")
-                return fnmatch.fnmatch(path_str, pat)
+                return fnmatch.fnmatch(path_str, pat) or fnmatch.fnmatch(path_str.split("/")[-1], pat)
 
             included = any(match_pattern(path, p) for p in include_patterns)
             if not included:
                 continue
 
-            excluded = any(match_pattern(path, p) for p in exclude_patterns)
+            excluded = any(match_pattern(path, p) for p in all_exclude_patterns)
             if excluded:
                 continue
 

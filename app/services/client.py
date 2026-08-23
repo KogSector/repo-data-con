@@ -20,6 +20,21 @@ class ServiceClient:
 
     def __init__(self):
         self.settings = get_settings()
+        self._http_client = None
+
+    async def get_http_client(self, timeout: float = 60.0):
+        """Get or create shared connection-pooled httpx AsyncClient."""
+        import httpx
+        if self._http_client is None or self._http_client.is_closed:
+            limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0)
+            self._http_client = httpx.AsyncClient(timeout=timeout, limits=limits)
+        return self._http_client
+
+    async def close(self):
+        """Close internal HTTP client if open."""
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
+            self._http_client = None
 
     async def trigger_source_sync(
         self,
@@ -110,9 +125,9 @@ class ServiceClient:
             return False
 
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(f"{base_url}/health")
-                return response.status_code == 200
+            client = await self.get_http_client(timeout=5.0)
+            response = await client.get(f"{base_url}/health")
+            return response.status_code == 200
         except Exception:
             return False
 
@@ -145,11 +160,11 @@ class ServiceClient:
         while (asyncio.get_event_loop().time() - start_time) < max_wait_seconds:
             attempt += 1
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.get(f"{base_url}/health")
-                    if response.status_code == 200:
-                        logger.info(f"[SERVICE-CLIENT] Downstream service {service} is ready (attempt {attempt})")
-                        return True
+                client = await self.get_http_client(timeout=10.0)
+                response = await client.get(f"{base_url}/health")
+                if response.status_code == 200:
+                    logger.info(f"[SERVICE-CLIENT] Downstream service {service} is ready (attempt {attempt})")
+                    return True
             except Exception:
                 pass
             await asyncio.sleep(2)
@@ -215,14 +230,14 @@ class ServiceClient:
 
         for attempt in range(1, max_retries + 1):
             try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    req_headers = {"X-API-Key": self.settings.internal_api_key}
-                    if headers:
-                        req_headers.update(headers)
-                    response = await client.post(url, json=payload, headers=req_headers)
+                client = await self.get_http_client(timeout=timeout)
+                req_headers = {"X-API-Key": self.settings.internal_api_key}
+                if headers:
+                    req_headers.update(headers)
+                response = await client.post(url, json=payload, headers=req_headers)
 
-                    if response.status_code < 400:
-                        return response.json()
+                if response.status_code < 400:
+                    return response.json()
 
                     # Retryable server error — back off and retry
                     if response.status_code in retryable_statuses and attempt < max_retries:

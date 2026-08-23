@@ -266,22 +266,41 @@ async def sync_git_repo_api(
 
                 if content:
                     import os
+                    parts = clean_path.split("/")
+                    skip_dirs = {"__pycache__", ".git", "node_modules", ".venv", "venv", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", "dist", "build"}
+                    if any(p in skip_dirs for p in parts):
+                        continue
+
                     _, ext = os.path.splitext(clean_path.lower())
                     binary_exts = {
                         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".pdf",
                         ".zip", ".tar", ".gz", ".7z", ".rar",
                         ".exe", ".dll", ".so", ".dylib", ".bin", ".whl",
                         ".mp4", ".mp3", ".wav",
-                        ".ttf", ".woff", ".woff2", ".eot", ".svg", ".webp", ".tiff", ".otf"
+                        ".ttf", ".woff", ".woff2", ".eot", ".svg", ".webp", ".tiff", ".otf",
+                        ".pyc", ".pyo", ".pyd", ".class", ".jar", ".o", ".a", ".wasm"
                     }
                     if ext in binary_exts:
                         continue
+
+                    # Safe text extraction (skip binary files with null bytes)
+                    if isinstance(content, bytes):
+                        if b"\x00" in content[:1024]:
+                            continue  # Binary file detected
+                        try:
+                            text_content = content.decode("utf-8")
+                        except UnicodeDecodeError:
+                            continue  # Non-text binary file
+                    else:
+                        if "\x00" in content[:1024]:
+                            continue
+                        text_content = content
 
                     source_id_str = str(repo_record.id) if repo_record else source_id
                     file_type = router.detect_file_type(clean_path)
 
                     payload = {
-                        "content": content if isinstance(content, str) else content.decode("utf-8", errors="replace"),
+                        "content": text_content,
                         "filename": clean_path,
                         "source_id": source_id_str,
                         "user_id": user_id_str,
