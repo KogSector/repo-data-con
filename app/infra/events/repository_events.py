@@ -406,16 +406,16 @@ class RepoUpdateConsumer:
         try:
             import uuid
             from sqlalchemy import select as sa_select
-            from app.infra.db.postgres import get_session, Source
+            from app.infra.db.postgres import get_session, Repository
 
             async with get_session() as session:
-                query = sa_select(Source).where(Source.id == uuid.UUID(repo_id))
+                query = sa_select(Repository).where(Repository.id == uuid.UUID(repo_id))
                 result = await session.execute(query)
-                source_record = result.scalar_one_or_none()
-                if source_record:
-                    new_metadata = dict(source_record.source_metadata or {})
+                repo_record = result.scalar_one_or_none()
+                if repo_record:
+                    new_metadata = dict(repo_record.repository_metadata or {})
                     new_metadata["last_commit_hash"] = new_commit
-                    source_record.source_metadata = new_metadata
+                    repo_record.repository_metadata = new_metadata
                     await session.commit()
                     logger.info(
                         "Updated last_commit_hash in metadata from RepoUpdateConsumer",

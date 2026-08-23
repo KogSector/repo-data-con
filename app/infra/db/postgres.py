@@ -1,5 +1,5 @@
 """
-Data Connector Service - PostgreSQL Database Connection for Sources and Jobs Management
+Data Connector Service - PostgreSQL Database Connection for Repositories and Jobs Management
 """
 
 import structlog
@@ -21,20 +21,6 @@ class Base(DeclarativeBase):
 
 
 # Database Models
-class Source(Base):
-    __tablename__ = "sources"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), nullable=False)
-    type = Column(String(50), nullable=False)  # github, gitlab, local, etc.
-    uri = Column(String(500), unique=True, nullable=False)
-    name = Column(String(255))
-    source_metadata = Column(JSONB)
-    status = Column(String(50), default="active")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-
 class Job(Base):
     __tablename__ = "jobs"
 
@@ -70,6 +56,7 @@ class Repository(Base):
     source_id = Column(String(255), nullable=True)  # Links to CredentialStorage stored tokens
     last_sync = Column(DateTime(timezone=True), nullable=True)
     files_indexed = Column(Integer, default=0)
+    repository_metadata = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -86,24 +73,6 @@ class Credential(Base):
     expires_at = Column(DateTime(timezone=True), nullable=True)  # Credential expiry
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-
-# class DatabaseSource(Base):
-#     """Connected Database systems (PostgreSQL, MySQL, etc.)."""
-#     __tablename__ = "databases"
-#
-#     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-#     user_id = Column(String(255), nullable=True)  # Multi-tenant support
-#     name = Column(String(255), nullable=False)
-#     provider = Column(String(50), nullable=False)  # postgres, mysql, etc.
-#     connection_string = Column(String(1000), nullable=False)  # Encrypted or raw connection string
-#     status = Column(String(50), default="pending")  # pending, active, syncing, error
-#     description = Column(String(1000), nullable=True)
-#     last_sync = Column(DateTime(timezone=True), nullable=True)
-#     tables_synced = Column(Integer, default=0)
-#     records_synced = Column(Integer, default=0)
-#     created_at = Column(DateTime(timezone=True), server_default=func.now())
-#     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 # Global database engine and session
@@ -128,18 +97,24 @@ async def _connect_with_retry(database_url: str):
     logger.info("Connecting to PostgreSQL", url=database_url)
 
     # Configure async engine — only use SSL for cloud (Neon) PostgreSQL
-    connect_args = {"ssl": True} if "neon.tech" in database_url else {}
+    connect_args = {}
+    if "neon.tech" in database_url or "sslmode=" in database_url:
+        connect_args["ssl"] = "require"
+
     _engine = create_async_engine(
         database_url,
-        pool_size=20,
-        max_overflow=30,
+        pool_size=10,
+        max_overflow=20,
+        pool_timeout=30,
+        pool_recycle=1800,
         pool_pre_ping=True,
-        pool_recycle=3600,
-        echo=False,  # Set to True for SQL logging
+        echo=False,
         connect_args=connect_args,
     )
 
-    _session_factory = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
+    _session_factory = async_sessionmaker(
+        _engine, class_=AsyncSession, expire_on_commit=False
+    )
 
     # Test connection
     async with _engine.begin() as conn:
@@ -154,8 +129,9 @@ async def init_postgresql() -> None:
         settings = get_settings()
         await _connect_with_retry(settings.database_url)
 
-        # Create tables
+        # Drop legacy sources table and create repository tables
         async with _engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS sources CASCADE;"))
             await conn.run_sync(Base.metadata.create_all, checkfirst=True)
 
         logger.info("PostgreSQL tables created successfully")
@@ -210,81 +186,95 @@ async def health_check() -> dict:
 
 
 # Database Operations
-class SourceManager:
-    """Manages source operations in PostgreSQL."""
+class RepositoryManager:
+    """Manages repository operations in PostgreSQL."""
 
     @staticmethod
-    async def create_source(source_data: dict) -> uuid.UUID:
-        """Create a new source."""
+    async def create_repository(repo_data: dict) -> uuid.UUID:
+        """Create a new repository."""
         async with get_session() as session:
-            source = Source(**source_data)
-            session.add(source)
+            repo = Repository(**repo_data)
+            session.add(repo)
             await session.commit()
-            await session.refresh(source)
-            return source.id
+            await session.refresh(repo)
+            return repo.id
 
     @staticmethod
-    async def get_source_by_id(source_id: uuid.UUID) -> dict | None:
-        """Get source by ID."""
+    async def get_repository_by_id(repo_id: uuid.UUID) -> dict | None:
+        """Get repository by ID."""
         async with get_session() as session:
-            result = await session.get(Source, source_id)
+            result = await session.get(Repository, repo_id)
             if result:
                 return {
                     "id": str(result.id),
                     "user_id": str(result.user_id),
-                    "type": result.type,
-                    "uri": result.uri,
                     "name": result.name,
-                    "metadata": result.source_metadata,
+                    "provider": result.provider,
+                    "url": result.url,
+                    "branch": result.branch,
                     "status": result.status,
-                    "created_at": result.created_at.isoformat(),
-                    "updated_at": result.updated_at.isoformat(),
+                    "description": result.description,
+                    "language": result.language,
+                    "stars": result.stars,
+                    "forks": result.forks,
+                    "last_sync": result.last_sync.isoformat() if result.last_sync else None,
+                    "files_indexed": result.files_indexed,
+                    "metadata": result.repository_metadata,
+                    "created_at": result.created_at.isoformat() if result.created_at else None,
+                    "updated_at": result.updated_at.isoformat() if result.updated_at else None,
                 }
             return None
 
     @staticmethod
-    async def get_sources_by_user(user_id: uuid.UUID) -> list[dict]:
-        """Get all sources for a user."""
+    async def get_repositories_by_user(user_id: str) -> list[dict]:
+        """Get all repositories for a user."""
         async with get_session() as session:
             from sqlalchemy import select
 
-            stmt = select(Source).where(Source.user_id == user_id)
+            stmt = select(Repository).where(Repository.user_id == user_id)
             result = await session.execute(stmt)
-            sources = result.scalars().all()
+            repos = result.scalars().all()
 
             return [
                 {
-                    "id": str(source.id),
-                    "user_id": str(source.user_id),
-                    "type": source.type,
-                    "uri": source.uri,
-                    "name": source.name,
-                    "metadata": source.source_metadata,
-                    "status": source.status,
-                    "created_at": source.created_at.isoformat(),
-                    "updated_at": source.updated_at.isoformat(),
+                    "id": str(r.id),
+                    "user_id": str(r.user_id),
+                    "name": r.name,
+                    "provider": r.provider,
+                    "url": r.url,
+                    "branch": r.branch,
+                    "status": r.status,
+                    "description": r.description,
+                    "language": r.language,
+                    "stars": r.stars,
+                    "forks": r.forks,
+                    "last_sync": r.last_sync.isoformat() if r.last_sync else None,
+                    "files_indexed": r.files_indexed,
+                    "metadata": r.repository_metadata,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "updated_at": r.updated_at.isoformat() if r.updated_at else None,
                 }
-                for source in sources
+                for r in repos
             ]
 
     @staticmethod
-    async def update_source_status(source_id: uuid.UUID, status: str) -> bool:
-        """Update source status."""
+    async def update_repository_status(repo_id: uuid.UUID, status: str) -> bool:
+        """Update repository status."""
         async with get_session() as session:
             from sqlalchemy import update
 
-            stmt = update(Source).where(Source.id == source_id).values(status=status)
+            stmt = update(Repository).where(Repository.id == repo_id).values(status=status)
             result = await session.execute(stmt)
             await session.commit()
             return result.rowcount > 0
 
     @staticmethod
-    async def delete_source(source_id: uuid.UUID) -> bool:
-        """Delete a source."""
+    async def delete_repository(repo_id: uuid.UUID) -> bool:
+        """Delete a repository."""
         async with get_session() as session:
             from sqlalchemy import delete
 
-            stmt = delete(Source).where(Source.id == source_id)
+            stmt = delete(Repository).where(Repository.id == repo_id)
             result = await session.execute(stmt)
             await session.commit()
             return result.rowcount > 0

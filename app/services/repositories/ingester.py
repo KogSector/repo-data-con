@@ -4,7 +4,7 @@ import uuid
 from sqlalchemy import select as sa_select
 
 from app.config import get_settings
-from app.infra.db.postgres import get_session, Source
+from app.infra.db.postgres import get_session, Repository
 from app.services.client import get_service_client
 from app.router import get_router
 from app.models import FileType
@@ -13,11 +13,11 @@ logger = structlog.get_logger()
 settings = get_settings()
 
 
-async def trigger_repo_sync(source_id: str, source_type: str, metadata: Dict[str, Any] = None):
+async def trigger_repo_sync(repo_id: str, provider: str = "github", metadata: Dict[str, Any] = None):
     logger.info(
         "[SYNC] Starting background initial sync for repo",
-        source_id=source_id,
-        source_type=source_type,
+        repo_id=repo_id,
+        provider=provider,
     )
 
     try:
@@ -25,42 +25,50 @@ async def trigger_repo_sync(source_id: str, source_type: str, metadata: Dict[str
 
         await init_postgresql()
 
-        async with get_session() as session:
-            query = sa_select(Source).where(Source.id == uuid.UUID(source_id))
-            result = await session.execute(query)
-            source = result.scalar_one_or_none()
+        try:
+            repo_uuid = uuid.UUID(repo_id)
+        except ValueError:
+            repo_uuid = repo_id
 
-            if not source:
-                logger.error("[SYNC] Source not found in database", source_id=source_id)
+        async with get_session() as session:
+            query = sa_select(Repository).where(Repository.id == repo_uuid)
+            result = await session.execute(query)
+            repo = result.scalar_one_or_none()
+
+            if not repo:
+                logger.error("[SYNC] Repository not found in database", repo_id=repo_id)
                 return
 
-            uri = source.uri
-            metadata = source.source_metadata or {}
-            credentials = metadata.get("credentials")
+            uri = repo.url
+            meta = repo.repository_metadata or {}
+            credentials = meta.get("credentials")
+            user_id = str(repo.user_id) if repo.user_id else "system"
+            repo_provider = repo.provider or provider
 
-        success = await sync_git_repo_api(source_id, source_type, uri, credentials, metadata)
+        success = await sync_git_repo_api(repo_id, repo_provider, uri, credentials, meta, user_id=user_id)
 
         if not success:
-            logger.error("[SYNC] Sync failed or yielded no results", source_id=source_id)
+            logger.error("[SYNC] Sync failed or yielded no results", repo_id=repo_id)
             return
 
-        logger.info("[SYNC] === Sync stream completed ===", source_id=source_id)
+        logger.info("[SYNC] === Sync stream completed ===", repo_id=repo_id)
 
     except Exception as e:
         logger.error(
-            "[SYNC] Failed local sync download", source_id=source_id, error=str(e), exc_info=True
+            "[SYNC] Failed local sync download", repo_id=repo_id, error=str(e), exc_info=True
         )
 
 
 async def sync_git_repo_api(
-    source_id: str,
+    repo_id: str,
     provider: str,
     uri: str,
     credentials: Dict[str, str] | None,
     metadata: Dict[str, Any],
+    user_id: str = "system",
 ) -> bool:
     """Download git repository via API without cloning, and stream files."""
-    logger.info(f"Starting API stream sync for {provider}", source_id=source_id, uri=uri)
+    logger.info(f"Starting API stream sync for {provider}", repo_id=repo_id, uri=uri)
 
     try:
         connector = None
@@ -81,22 +89,25 @@ async def sync_git_repo_api(
             logger.error("Unsupported git provider", provider=provider)
             return False
 
-        # Fetch repository to get branch
-        from app.infra.db.postgres import Repository
+        try:
+            repo_uuid = uuid.UUID(repo_id)
+        except ValueError:
+            repo_uuid = repo_id
 
+        # Fetch repository to get branch
         async with get_session() as session:
             repo_result = await session.execute(
-                sa_select(Repository).where(Repository.source_id == source_id)
+                sa_select(Repository).where(Repository.id == repo_uuid)
             )
             repo_record = repo_result.scalars().first()
 
-        branch = repo_record.branch if repo_record else "main"
+        branch = repo_record.branch if repo_record and repo_record.branch else "main"
 
         # Parse the URI to get the owner/repo path and any nested folder
         from app.services.repositories.streamer import RepoStreamer
         streamer = RepoStreamer()
-        repo_id, folder_path = streamer._parse_repo_url(uri, provider)
-        repo_path = repo_id
+        parsed_repo_id, folder_path = streamer._parse_repo_url(uri, provider)
+        repo_path = parsed_repo_id
 
         # Use fetch_source to get the tree and download files in memory
         provided_credentials = credentials or {}
@@ -128,16 +139,8 @@ async def sync_git_repo_api(
             from app.security.credentials import get_jwt_generator
 
             jwt_generator = get_jwt_generator()
-            user_id_str = "system"
-            async with get_session() as session:
-                query = sa_select(Source).where(Source.id == uuid.UUID(source_id))
-                result = await session.execute(query)
-                source = result.scalar_one_or_none()
-                if source and source.user_id:
-                    user_id_str = str(source.user_id)
-
             credential_ref = jwt_generator.generate_credential_ref(
-                provider=provider, repo_id=source_id, user_id=user_id_str
+                provider=provider, repo_id=repo_id, user_id=user_id
             )
 
             from app.infra.events.repository_events import get_repo_event_publisher
@@ -145,7 +148,7 @@ async def sync_git_repo_api(
             publisher = get_repo_event_publisher()
             if publisher:
                 success = publisher.publish_repo_updated(
-                    repo_id=source_id,
+                    repo_id=repo_id,
                     url=uri,
                     branch=branch,
                     provider=provider,
@@ -158,16 +161,17 @@ async def sync_git_repo_api(
                     # Update metadata with new commit hash
                     try:
                         async with get_session() as session:
-                            query = sa_select(Source).where(Source.id == uuid.UUID(source_id))
-                            update_result = await session.execute(query)
-                            source_record = update_result.scalar_one_or_none()
-                            if source_record:
-                                new_metadata = dict(source_record.source_metadata or {})
+                            update_result = await session.execute(
+                                sa_select(Repository).where(Repository.id == repo_uuid)
+                            )
+                            repo_rec = update_result.scalar_one_or_none()
+                            if repo_rec:
+                                new_metadata = dict(repo_rec.repository_metadata or {})
                                 new_metadata["last_commit_hash"] = latest_commit
-                                source_record.source_metadata = new_metadata
+                                repo_rec.repository_metadata = new_metadata
                                 await session.commit()
                                 logger.info(
-                                    "Updated last_commit_hash in metadata", source_id=source_id
+                                    "Updated last_commit_hash in metadata", repo_id=repo_id
                                 )
                     except Exception as db_e:
                         logger.error("Failed to update last_commit_hash", error=str(db_e))
@@ -177,7 +181,6 @@ async def sync_git_repo_api(
 
         include_patterns = metadata.get("include_patterns", ["**/*"])
         if folder_path:
-            # If the user specified a nested folder, limit download to that folder.
             if "**/*" in include_patterns:
                 include_patterns.remove("**/*")
             include_patterns.append(f"{folder_path}/**/*")
@@ -195,56 +198,50 @@ async def sync_git_repo_api(
             # Token was refreshed, update DB
             try:
                 async with get_session() as session:
-                    query = sa_select(Source).where(Source.id == uuid.UUID(source_id))
-                    update_result = await session.execute(query)
-                    source_record = update_result.scalar_one_or_none()
-                    if source_record:
-                        new_metadata = dict(source_record.source_metadata or {})
+                    update_result = await session.execute(
+                        sa_select(Repository).where(Repository.id == repo_uuid)
+                    )
+                    repo_rec = update_result.scalar_one_or_none()
+                    if repo_rec:
+                        new_metadata = dict(repo_rec.repository_metadata or {})
                         new_metadata["credentials"] = provided_credentials
                         if latest_commit:
                             new_metadata["last_commit_hash"] = latest_commit
-                        source_record.source_metadata = new_metadata
+                        repo_rec.repository_metadata = new_metadata
                         await session.commit()
                         logger.info(
-                            "Updated source metadata with refreshed tokens and last_commit_hash",
-                            source_id=source_id,
+                            "Updated repository metadata with refreshed tokens and last_commit_hash",
+                            repo_id=repo_id,
                         )
             except Exception as db_e:
                 logger.error(
-                    "Failed to update source metadata with refreshed token",
-                    source_id=source_id,
+                    "Failed to update repository metadata with refreshed token",
+                    repo_id=repo_id,
                     error=str(db_e),
                 )
         elif latest_commit:
             try:
                 async with get_session() as session:
-                    query = sa_select(Source).where(Source.id == uuid.UUID(source_id))
-                    update_result = await session.execute(query)
-                    source_record = update_result.scalar_one_or_none()
-                    if source_record:
-                        new_metadata = dict(source_record.source_metadata or {})
+                    update_result = await session.execute(
+                        sa_select(Repository).where(Repository.id == repo_uuid)
+                    )
+                    repo_rec = update_result.scalar_one_or_none()
+                    if repo_rec:
+                        new_metadata = dict(repo_rec.repository_metadata or {})
                         new_metadata["last_commit_hash"] = latest_commit
-                        source_record.source_metadata = new_metadata
+                        repo_rec.repository_metadata = new_metadata
                         await session.commit()
                         logger.info(
-                            "Updated source metadata with last_commit_hash", source_id=source_id
+                            "Updated repository metadata with last_commit_hash", repo_id=repo_id
                         )
             except Exception as db_e:
                 logger.error(
-                    "Failed to update source metadata with last_commit_hash",
-                    source_id=source_id,
+                    "Failed to update repository metadata with last_commit_hash",
+                    repo_id=repo_id,
                     error=str(db_e),
                 )
 
-        logger.info(f"Streaming {len(files_processed)} files from {provider}", source_id=source_id)
-
-        user_id_str = "system"
-        async with get_session() as session:
-            query = sa_select(Source).where(Source.id == uuid.UUID(source_id))
-            result = await session.execute(query)
-            source = result.scalar_one_or_none()
-            if source and source.user_id:
-                user_id_str = str(source.user_id)
+        logger.info(f"Streaming {len(files_processed)} files from {provider}", repo_id=repo_id)
 
         router = get_router()
         client = get_service_client()
@@ -296,14 +293,11 @@ async def sync_git_repo_api(
                             continue
                         text_content = content
 
-                    source_id_str = str(repo_record.id) if repo_record else source_id
-                    file_type = router.detect_file_type(clean_path)
-
                     payload = {
                         "content": text_content,
                         "filename": clean_path,
-                        "source_id": source_id_str,
-                        "user_id": user_id_str,
+                        "source_id": repo_id,
+                        "user_id": user_id,
                         "is_base64": False
                     }
                     await client.send_to_processor_http(
@@ -327,7 +321,7 @@ async def sync_git_repo_api(
                     logger.error(
                         "[CIRCUIT-BREAKER] Aborting file stream — unified-processor appears down",
                         provider=provider,
-                        source_id=source_id,
+                        repo_id=repo_id,
                         files_sent=files_sent,
                         files_failed=files_failed,
                         files_remaining=remaining,
@@ -337,12 +331,23 @@ async def sync_git_repo_api(
 
         logger.info(
             "[SYNC] File streaming completed",
-            source_id=source_id,
+            repo_id=repo_id,
             provider=provider,
             files_sent=files_sent,
             files_failed=files_failed,
             total_files=len(files_processed),
         )
+
+        # Update repository status to active
+        async with get_session() as session:
+            update_result = await session.execute(
+                sa_select(Repository).where(Repository.id == repo_uuid)
+            )
+            repo_rec = update_result.scalar_one_or_none()
+            if repo_rec:
+                repo_rec.status = "active"
+                repo_rec.files_indexed = files_sent
+                await session.commit()
 
         return True
 

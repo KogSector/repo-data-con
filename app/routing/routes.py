@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, BackgroundTasks, Request, Header, 
 from app.utils.user import parse_user_id
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select, delete
 
 from app.models import (
     SourceResponse,
@@ -18,7 +19,7 @@ from app.models import (
     JobStatus,
     IngestRequest,
 )
-from app.infra.db.postgres import get_session, Source
+from app.infra.db.postgres import get_session, Repository
 from app.router import get_router
 from app.services import get_job_manager, get_service_client
 from app.config import get_settings
@@ -45,38 +46,25 @@ class HealthResponse(BaseModel):
 
 
 class SourceCreateRequest(BaseModel):
-    """Request to create a new source."""
+    """Request to create a new repository/source."""
 
-    type: SourceType
-    name: str
-    uri: str
-    credentials: dict[str, Any] | None = None
-    branch: str | None = None
-    include_patterns: list[str] = ["**/*"]
-    exclude_patterns: list[str] = []
-    metadata: dict[str, Any] = {}
+    type: Optional[SourceType] = SourceType.GITHUB
+    provider: Optional[str] = None
+    uri: Optional[str] = None
+    url: Optional[str] = None
+    name: Optional[str] = None
+    credentials: Optional[dict] = None
+    branch: Optional[str] = "main"
+    include_patterns: Optional[list[str]] = None
+    exclude_patterns: Optional[list[str]] = None
+    metadata: Optional[dict] = None
 
-    def validate(self) -> None:
-        """Validate the request data."""
-        try:
-            if not self.name or len(self.name.strip()) == 0:
-                raise ValidationError("Source name is required")
-            if len(self.name) > 255:
-                raise ValidationError("Source name must be less than 255 characters")
-            if self.type in ["github", "gitlab", "bitbucket"]:
-                self.uri = InputValidator.validate_repository_url(self.uri)
-            else:
-                if not self.uri or len(self.uri.strip()) == 0:
-                    raise ValidationError("URI is required")
-            if self.type in ["github", "gitlab", "bitbucket"]:
-                self.branch = InputValidator.validate_branch_name(self.branch)
-            self.include_patterns = InputValidator.validate_include_patterns(self.include_patterns)
-            self.exclude_patterns = InputValidator.validate_exclude_patterns(self.exclude_patterns)
-            if self.credentials:
-                self.credentials = InputValidator.validate_oauth_credentials(self.credentials)
-        except ValidationError as e:
-            raise ValidationError(f"Validation failed: {str(e)}")
-        self.metadata = InputValidator.sanitize_metadata(self.metadata)
+    def validate(self):
+        target_uri = self.uri or self.url
+        if not target_uri:
+            raise ValidationError("Repository URL/URI is required")
+        if not self.name:
+            self.name = target_uri.rstrip("/").split("/")[-1].replace(".git", "")
 
 
 class RouteFileRequest(BaseModel):
@@ -90,28 +78,6 @@ class RouteFileResponse(BaseModel):
     total: int
 
 
-# External Routes Models
-class GoogleDriveCallbackRequest(BaseModel):
-    code: str
-
-
-class GoogleDriveSyncRequest(BaseModel):
-    folder_id: str | None = None
-    include_patterns: List[str] = ["**/*"]
-    exclude_patterns: List[str] = []
-
-
-class DropboxCallbackRequest(BaseModel):
-    code: str
-
-
-class DropboxSyncRequest(BaseModel):
-    folder_path: str | None = None
-    include_patterns: List[str] = ["**/*"]
-    exclude_patterns: List[str] = []
-
-
-# Internal Routes Models
 class CredentialExchangeRequest(BaseModel):
     credential_ref: str
 
@@ -119,8 +85,8 @@ class CredentialExchangeRequest(BaseModel):
 class CredentialExchangeResponse(BaseModel):
     provider: str
     access_token: str
-    refresh_token: str | None = None
-    expires_at: str | None = None
+    refresh_token: Optional[str] = None
+    expires_at: Optional[str] = None
 
 
 # =============================================================================
@@ -129,14 +95,15 @@ class CredentialExchangeResponse(BaseModel):
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health_check():
+async def health():
     """Health check endpoint."""
-    return HealthResponse(
-        status="healthy",
-        service="data-connector",
-        version="2.0.0",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-    )
+    return HealthResponse(timestamp=datetime.now(timezone.utc).isoformat())
+
+
+@router.get("/api/v1/health", response_model=HealthResponse)
+async def api_health():
+    """API versioned health check endpoint."""
+    return HealthResponse(timestamp=datetime.now(timezone.utc).isoformat())
 
 
 @router.get("/api/v1/status")
@@ -156,7 +123,7 @@ async def get_status():
 
 
 # =============================================================================
-# Source Management Endpoints
+# Source / Repository Management Endpoints (Backward-compatible /api/sources)
 # =============================================================================
 
 
@@ -164,330 +131,225 @@ async def get_status():
 async def create_source(
     request: SourceCreateRequest, http_request: Request, background_tasks: BackgroundTasks
 ):
-    """Create a new data source."""
+    """Create a new data source (stores in repositories table)."""
+    target_url = request.url or request.uri
+    target_provider = request.provider or (request.type.value if request.type else "github")
+    target_name = request.name or target_url.rstrip("/").split("/")[-1].replace(".git", "")
+
     logger.info(
-        "[SOURCE-CREATE] Starting source creation",
-        name=request.name,
-        type=request.type.value,
-        uri=request.uri,
+        "[SOURCE-CREATE] Starting repository source creation",
+        name=target_name,
+        type=target_provider,
+        uri=target_url,
     )
-    try:
-        request.validate()
-    except ValidationError as e:
-        logger.warning("Request validation failed", error=str(e))
-        raise
-    except Exception as e:
-        logger.error("Unexpected validation error", error=str(e))
-        raise HTTPException(status_code=500, detail="Validation error")
+
+    user_id = http_request.headers.get("x-user-id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User authentication required")
+
+    # Auto-fetch OAuth tokens from auth-middleware if needed
+    credentials = request.credentials or {}
+    if not credentials.get("access_token") and target_provider in ["github", "gitlab", "bitbucket"]:
+        try:
+            client = get_service_client()
+            tokens = await client.get_auth_token(user_id, target_provider)
+            if tokens and tokens.get("access_token"):
+                credentials = tokens
+        except Exception as e:
+            logger.warning("Failed to retrieve OAuth tokens", error=str(e))
+
+    repo_metadata = {
+        "credentials": credentials,
+        "branch": request.branch or "main",
+        "include_patterns": request.include_patterns or ["**/*"],
+        "exclude_patterns": request.exclude_patterns or ['node_modules', 'dist', 'build', '.git', 'target', '__pycache__', 'vendor', '.venv', 'venv'],
+        "metadata": request.metadata or {},
+    }
 
     async with get_session() as session:
-        # Auto-fetch OAuth tokens from auth-middleware for providers that need them
-        providers_needing_tokens = [
-            "github",
-            "gitlab",
-            "bitbucket",
-            "custom",
-        ]
-        if not request.credentials and request.type in providers_needing_tokens:
-            user_id = http_request.headers.get("x-user-id")
-            if not user_id:
-                raise HTTPException(status_code=401, detail="User authentication required")
-            client = get_service_client()
-            try:
-                # Map source type to the provider name stored in auth-middleware
-                provider_name = request.type.value
-                if provider_name == "custom":
-                    provider_name = "custom_apps"
-
-                tokens = await client.get_auth_token(user_id, provider_name)
-                if not tokens or not tokens.get("access_token"):
-                    raise HTTPException(
-                        status_code=401, detail=f"No OAuth tokens found for {request.type.value}"
-                    )
-                request.credentials = tokens
-            except HTTPException:
-                raise
-            except Exception as e:
-                logger.error("Failed to retrieve OAuth tokens", error=str(e))
-                raise HTTPException(status_code=503, detail="Authentication service unavailable")
-
-        from sqlalchemy import select as sa_select
-
-        existing = await session.execute(sa_select(Source).where(Source.uri == request.uri))
-        existing_source = existing.scalar_one_or_none()
-
-        request_user_id = parse_user_id(
-            http_request.headers.get("x-user-id")
+        normalized_url = target_url.rstrip("/").rstrip(".git").lower()
+        existing = await session.execute(
+            select(Repository).where(Repository.user_id == user_id)
         )
+        existing_repo = None
+        for r in existing.scalars().all():
+            if (r.url or "").rstrip("/").rstrip(".git").lower() == normalized_url:
+                existing_repo = r
+                break
 
-        if existing_source:
-            if existing_source.user_id == request_user_id:
-                logger.info(
-                    "[SOURCE-CREATE] Source already exists for same user, updating instead",
-                    source_id=str(existing_source.id),
-                )
-                existing_source.name = request.name
-                existing_source.source_metadata = {
-                    "credentials": request.credentials,
-                    "branch": request.branch,
-                    "include_patterns": request.include_patterns,
-                    "exclude_patterns": request.exclude_patterns,
-                    "metadata": request.metadata,
-                }
-                existing_source.status = "pending"
-                existing_source.updated_at = datetime.now(timezone.utc)
-
-                from app.infra.db.postgres import Repository
-
-                if request.type.value in ["github", "gitlab", "bitbucket"]:
-                    existing_repo = await session.execute(
-                        sa_select(Repository).where(Repository.url == request.uri)
-                    )
-                    existing_repo_obj = existing_repo.scalars().first()
-                    if not existing_repo_obj:
-                        repo = Repository(
-                            user_id=str(request_user_id),
-                            name=request.name,
-                            provider=request.type.value,
-                            url=request.uri,
-                            branch=request.branch or "main",
-                            source_id=str(existing_source.id),
-                            status="pending",
-                        )
-                        session.add(repo)
-                    else:
-                        existing_repo_obj.status = "pending"
-                        existing_repo_obj.source_id = str(existing_source.id)
-                        existing_repo_obj.branch = request.branch or "main"
-                        existing_repo_obj.name = request.name
-                        existing_repo_obj.updated_at = datetime.now(timezone.utc)
-
-                try:
-                    await session.commit()
-                except IntegrityError as e:
-                    await session.rollback()
-                    raise HTTPException(status_code=409, detail=f"Source already exists: {str(e)}")
-
-                await session.refresh(existing_source)
-
-                if existing_source.type in ["github", "gitlab", "bitbucket"]:
-                    from app.services.repositories.ingester import trigger_repo_sync
-
-                    background_tasks.add_task(
-                        trigger_repo_sync,
-                        str(existing_source.id),
-                        existing_source.type,
-                        existing_source.source_metadata,
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=400, detail="Invalid source type for repository connector"
-                    )
-
-                return SourceResponse(
-                    id=str(existing_source.id),
-                    type=SourceType(existing_source.type),
-                    name=existing_source.name,
-                    uri=existing_source.uri,
-                    status=existing_source.status,
-                    created_at=existing_source.created_at,
-                    updated_at=existing_source.updated_at,
-                    metadata=existing_source.source_metadata or {},
-                    syncStarted=True,
-                )
-            else:
-                raise HTTPException(
-                    status_code=409,
-                    detail="This repository has already been connected by another user.",
-                )
-
-        source = Source(
-            user_id=request_user_id,
-            type=request.type.value,
-            uri=request.uri,
-            name=request.name,
-            source_metadata={
-                "credentials": request.credentials,
-                "branch": request.branch,
-                "include_patterns": request.include_patterns,
-                "exclude_patterns": request.exclude_patterns,
-                "metadata": request.metadata,
-            },
-        )
-
-        session.add(source)
-        await session.flush()
-
-        from app.infra.db.postgres import Repository
-
-        if request.type.value in ["github", "gitlab", "bitbucket"]:
-            existing_repo = await session.execute(
-                sa_select(Repository).where(Repository.url == request.uri)
-            )
-            existing_repo_obj = existing_repo.scalars().first()
-            if not existing_repo_obj:
-                repo = Repository(
-                    user_id=str(request_user_id),
-                    name=request.name,
-                    provider=request.type.value,
-                    url=request.uri,
-                    branch=request.branch or "main",
-                    source_id=str(source.id),
-                    status="pending",
-                )
-                session.add(repo)
-            else:
-                existing_repo_obj.status = "pending"
-                existing_repo_obj.source_id = str(source.id)
-
-        try:
+        if existing_repo:
+            existing_repo.name = target_name
+            existing_repo.provider = target_provider
+            existing_repo.branch = request.branch or "main"
+            existing_repo.status = "sync_in_progress"
+            existing_repo.repository_metadata = repo_metadata
+            existing_repo.updated_at = datetime.now(timezone.utc)
             await session.commit()
-        except IntegrityError as e:
-            await session.rollback()
-            raise HTTPException(status_code=409, detail=f"Source already exists: {str(e)}")
-        await session.refresh(source)
-
-        if source.type in ["github", "gitlab", "bitbucket"]:
-            from app.services.repositories.ingester import trigger_repo_sync
-
-            background_tasks.add_task(
-                trigger_repo_sync, str(source.id), source.type, source.source_metadata
-            )
+            await session.refresh(existing_repo)
+            repo = existing_repo
         else:
-            raise HTTPException(
-                status_code=400, detail="Invalid source type for repository connector"
+            repo = Repository(
+                user_id=user_id,
+                name=target_name,
+                provider=target_provider,
+                url=target_url,
+                branch=request.branch or "main",
+                status="sync_in_progress",
+                repository_metadata=repo_metadata,
             )
+            session.add(repo)
+            await session.commit()
+            await session.refresh(repo)
 
-        return SourceResponse(
-            id=str(source.id),
-            type=SourceType(source.type),
-            name=source.name,
-            uri=source.uri,
-            status=source.status,
-            created_at=source.created_at,
-            updated_at=source.updated_at,
-            metadata=source.source_metadata or {},
-            syncStarted=True,
-        )
+    repo_id_str = str(repo.id)
+
+    # Store credential
+    access_token = credentials.get("access_token")
+    if access_token:
+        try:
+            from app.routing.repositories_routes import get_credential_storage
+            storage = get_credential_storage()
+            await storage.store_credential(
+                repo_id=repo_id_str,
+                provider=target_provider,
+                user_id=user_id,
+                access_token=access_token,
+                refresh_token=credentials.get("refresh_token"),
+                expires_in=credentials.get("expires_in"),
+            )
+        except Exception as cred_err:
+            logger.warning("[SOURCE-CREATE] Failed to store credential", error=str(cred_err))
+
+    # Trigger background sync & stream to repo-uni-proc
+    from app.services.repositories.ingester import trigger_repo_sync
+    background_tasks.add_task(
+        trigger_repo_sync,
+        repo_id=repo_id_str,
+        provider=target_provider,
+        metadata=repo_metadata,
+    )
+
+    from app.routing.repositories_routes import get_repo_streamer
+    streamer = get_repo_streamer()
+    background_tasks.add_task(
+        streamer.stream_repository,
+        repo_id=repo_id_str,
+        provider=target_provider,
+        url=target_url,
+        branch=request.branch or "main",
+        access_token=access_token or "",
+        user_id=user_id,
+    )
+
+    return SourceResponse(
+        id=repo_id_str,
+        type=SourceType.GITHUB if target_provider == "github" else (SourceType.GITLAB if target_provider == "gitlab" else SourceType.BITBUCKET),
+        name=repo.name,
+        uri=repo.url,
+        status=repo.status,
+        created_at=repo.created_at,
+        updated_at=repo.updated_at,
+        metadata=repo_metadata,
+        syncStarted=True,
+    )
 
 
 @router.get("/api/sources")
 async def list_sources(
     http_request: Request, type: SourceType | None = None, limit: int = 50, offset: int = 0
 ):
-    """List all data sources."""
+    """List all connected repositories as sources."""
     user_id = http_request.headers.get("x-user-id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User authentication required")
 
     async with get_session() as session:
-        from sqlalchemy import select
-
-        query = select(Source).where(Source.user_id == parse_user_id(user_id))
+        query = select(Repository).where(Repository.user_id == user_id)
         if type:
-            query = query.where(Source.type == type.value)
+            query = query.where(Repository.provider == type.value)
         query = query.offset(offset).limit(limit)
         result = await session.execute(query)
-        sources = result.scalars().all()
+        repos = result.scalars().all()
 
         return {
             "sources": [
                 {
-                    "id": str(source.id),
-                    "type": source.type,
-                    "name": source.name,
-                    "uri": source.uri,
-                    "status": source.status,
-                    "created_at": source.created_at.isoformat(),
-                    "updated_at": source.updated_at.isoformat(),
-                    "metadata": source.source_metadata or {},
+                    "id": str(repo.id),
+                    "type": repo.provider,
+                    "name": repo.name,
+                    "uri": repo.url,
+                    "status": repo.status,
+                    "created_at": repo.created_at.isoformat() if repo.created_at else None,
+                    "updated_at": repo.updated_at.isoformat() if repo.updated_at else None,
+                    "metadata": repo.repository_metadata or {},
                 }
-                for source in sources
+                for repo in repos
             ],
-            "total": len(sources),
+            "total": len(repos),
         }
 
 
 @router.get("/api/sources/{source_id}")
 async def get_source(source_id: str, http_request: Request):
-    """Get a specific source by ID."""
+    """Get a specific repository source by ID."""
     user_id = http_request.headers.get("x-user-id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User authentication required")
 
+    try:
+        rid = uuid.UUID(source_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid source ID format")
+
     async with get_session() as session:
-        from sqlalchemy import select
-
-        try:
-            query = select(Source).where(Source.id == uuid.UUID(source_id))
-            result = await session.execute(query)
-            source = result.scalar_one_or_none()
-        except Exception:
-            raise HTTPException(status_code=404, detail="Source not found")
-
-        if not source or source.user_id != parse_user_id(user_id):
+        repo = await session.get(Repository, rid)
+        if not repo or repo.user_id != user_id:
             raise HTTPException(status_code=404, detail="Source not found")
 
         return {
-            "id": str(source.id),
-            "type": source.type,
-            "name": source.name,
-            "uri": source.uri,
-            "status": source.status,
-            "created_at": source.created_at.isoformat(),
-            "updated_at": source.updated_at.isoformat(),
-            "metadata": source.source_metadata or {},
+            "id": str(repo.id),
+            "type": repo.provider,
+            "name": repo.name,
+            "uri": repo.url,
+            "status": repo.status,
+            "created_at": repo.created_at.isoformat() if repo.created_at else None,
+            "updated_at": repo.updated_at.isoformat() if repo.updated_at else None,
+            "metadata": repo.repository_metadata or {},
         }
 
 
 @router.delete("/api/sources/{source_id}")
 async def delete_source(source_id: str, http_request: Request):
-    """Delete a data source."""
+    """Delete a repository source."""
     user_id = http_request.headers.get("x-user-id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User authentication required")
 
+    try:
+        rid = uuid.UUID(source_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid source ID format")
+
     async with get_session() as session:
-        try:
-            source_uuid = uuid.UUID(source_id)
-            source = await session.get(Source, source_uuid)
-        except Exception:
+        repo = await session.get(Repository, rid)
+        if not repo or repo.user_id != user_id:
             raise HTTPException(status_code=404, detail="Source not found")
 
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
-
-        if source.user_id != parse_user_id(user_id):
-            raise HTTPException(status_code=404, detail="Source not found")
-
-        from app.infra.db.postgres import Repository
-        from sqlalchemy import select
-
-        repo_query = select(Repository).where(Repository.source_id == source_id)
-        repo_result = await session.execute(repo_query)
-        repo = repo_result.scalars().first()
-        if repo:
-            await session.delete(repo)
-
-        await session.delete(source)
+        user_id_str = repo.user_id if repo.user_id else "system"
+        await session.delete(repo)
         await session.commit()
 
-        from app.services.client import get_service_client
         client = get_service_client()
         import asyncio
-
-        asyncio.create_task(client.delete_graph_group(source_id, user_id))
+        asyncio.create_task(client.delete_graph_group(str(rid), user_id_str))
 
         return {"success": True, "message": "Source deleted successfully"}
 
 
 @router.post("/api/sources/{source_id}/sync")
 async def sync_source_endpoint(source_id: str, background_tasks: BackgroundTasks):
-    """Trigger a manual sync for a source."""
+    """Trigger a manual sync for a repository."""
     return await start_ingestion(IngestRequest(source_id=source_id), background_tasks)
-
-
-
 
 
 # =============================================================================
@@ -499,11 +361,8 @@ async def process_repo_update_webhook(
     provider: str, repo_url: str, branch: str, old_commit: str, new_commit: str
 ):
     """Process repository update webhook by emitting REPO_UPDATED event."""
-    from app.infra.db.postgres import get_session, Repository
-    from sqlalchemy import select
     from app.infra.events.repository_events import get_repo_event_publisher
-    from app.security.credentials import get_credential_storage
-    from app.security.credentials import get_jwt_generator
+    from app.routing.repositories_routes import get_credential_storage, get_jwt_generator
     import uuid as uuid_lib
 
     try:
@@ -526,20 +385,11 @@ async def process_repo_update_webhook(
                 return
 
             repo_id = str(repo.id)
-            user_id = "system"
+            user_id = str(repo.user_id) if repo.user_id else "system"
 
-            access_token = None
-            if repo.source_id:
-                try:
-                    source_uuid = uuid_lib.UUID(repo.source_id)
-                    source_obj = await session.get(Source, source_uuid)
-                    if source_obj and source_obj.source_metadata:
-                        credentials = source_obj.source_metadata.get("credentials", {})
-                        access_token = credentials.get("access_token")
-                except Exception as e:
-                    logger.warning(
-                        "Failed to get credentials for webhook", repo_id=repo_id, error=str(e)
-                    )
+            meta = repo.repository_metadata or {}
+            credentials = meta.get("credentials", {})
+            access_token = credentials.get("access_token")
 
             if not access_token:
                 logger.error(
@@ -723,22 +573,25 @@ async def get_oauth_token(
     source_id: str = Query(...),
     x_internal_api_key: str = Header(..., alias="X-Internal-Api-Key"),
 ):
-    """Retrieve a decrypted access token for a source."""
+    """Retrieve a decrypted access token for a repository."""
     if x_internal_api_key != settings.internal_api_key:
         raise HTTPException(status_code=401, detail="Invalid internal API key")
 
     try:
-        from sqlalchemy import select
+        try:
+            rid = uuid.UUID(source_id)
+        except ValueError:
+            rid = source_id
 
         async with get_session() as session:
-            query = select(Source).where(Source.id == uuid.UUID(source_id))
+            query = select(Repository).where(Repository.id == rid)
             result = await session.execute(query)
-            source = result.scalar_one_or_none()
+            repo = result.scalar_one_or_none()
 
-            if not source:
-                raise HTTPException(status_code=404, detail="Source not found")
+            if not repo:
+                raise HTTPException(status_code=404, detail="Repository not found")
 
-            metadata = source.source_metadata or {}
+            metadata = repo.repository_metadata or {}
             credentials = metadata.get("credentials", {})
 
             if not credentials or not credentials.get("access_token"):
@@ -769,8 +622,7 @@ async def exchange_credential_ref(
         raise HTTPException(status_code=401, detail="Invalid internal API key")
 
     try:
-        from app.security.credentials import get_jwt_generator
-        from app.security.credentials import get_credential_storage
+        from app.routing.repositories_routes import get_jwt_generator, get_credential_storage
         import jwt
 
         jwt_generator = get_jwt_generator()
@@ -864,119 +716,87 @@ async def route_single_file(file_path: str):
 
 @router.post("/api/v1/ingest")
 async def start_ingestion(request: IngestRequest, background_tasks: BackgroundTasks):
-    """Start ingesting a source."""
+    """Start ingesting a repository."""
     async with get_session() as session:
-        from sqlalchemy import select
-
         job_manager = get_job_manager()
 
         try:
-            query = select(Source).where(Source.id == uuid.UUID(request.source_id))
-            result = await session.execute(query)
-            source = result.scalar_one_or_none()
-        except Exception:
-            raise HTTPException(status_code=404, detail="Source not found")
+            rid = uuid.UUID(request.source_id)
+        except ValueError:
+            rid = request.source_id
 
-        if not source:
-            raise HTTPException(status_code=404, detail="Source not found")
+        query = select(Repository).where(Repository.id == rid)
+        result = await session.execute(query)
+        repo = result.scalar_one_or_none()
+
+        if not repo:
+            raise HTTPException(status_code=404, detail="Repository not found")
 
         job = await job_manager.create_job(
             source_id=request.source_id,
-            source_type=SourceType(source.type),
+            source_type=SourceType.GITHUB if repo.provider == "github" else (SourceType.GITLAB if repo.provider == "gitlab" else SourceType.BITBUCKET),
             metadata={"force_reprocess": request.force_reprocess},
         )
 
-        background_tasks.add_task(process_source_background, job.id, request.source_id, source)
+        background_tasks.add_task(process_source_background, job.id, request.source_id, repo)
 
         return {"job_id": job.id, "status": job.status.value, "message": "Ingestion started"}
 
 
-async def process_source_background(job_id: str, source_id: str, source_obj):
-    """Background task to process a source."""
+async def process_source_background(job_id: str, source_id: str, repo_obj):
+    """Background task to process a repository."""
     job_manager = get_job_manager()
     try:
         await job_manager.update_job_status(job_id, JobStatus.PROCESSING)
 
-        # We fetch the source again since it's an async session and SQLAlchemy objects
-        # should not be passed across sessions
-        async with get_session() as session:
-            from sqlalchemy import select
-            import uuid
+        try:
+            rid = uuid.UUID(source_id)
+        except ValueError:
+            rid = source_id
 
-            query = select(Source).where(Source.id == uuid.UUID(source_id))
+        async with get_session() as session:
+            query = select(Repository).where(Repository.id == rid)
             result = await session.execute(query)
-            source = result.scalar_one_or_none()
-            if not source:
+            repo = result.scalar_one_or_none()
+            if not repo:
                 logger.error(
-                    "Source not found in background task", job_id=job_id, source_id=source_id
+                    "Repository not found in background task", job_id=job_id, source_id=source_id
                 )
                 await job_manager.update_job_status(job_id, JobStatus.FAILED)
                 return
 
-            source_type = source.type
-            uri = source.uri
-            metadata = source.source_metadata or {}
+            provider = repo.provider or "github"
+            uri = repo.url
+            metadata = repo.repository_metadata or {}
             credentials = metadata.get("credentials", {})
-            branch = metadata.get("branch") or "main"
+            branch = repo.branch or "main"
             access_token = credentials.get("access_token")
-            user_id = str(source.user_id)
+            user_id = str(repo.user_id) if repo.user_id else "system"
 
         logger.info(
-            "Processing source", job_id=job_id, source_id=source_id, source_type=source_type
+            "Processing repository sync", job_id=job_id, repo_id=source_id, provider=provider
         )
 
-        if source_type in ["github", "gitlab", "bitbucket"]:
-            from app.security.credentials import get_credential_storage
-            from app.security.credentials import get_jwt_generator
-            from app.infra.events.repository_events import get_repo_event_publisher
+        # Trigger ingester sync
+        from app.services.repositories.ingester import trigger_repo_sync
+        await trigger_repo_sync(source_id, provider, metadata)
 
-            credential_storage = get_credential_storage()
-            jwt_generator = get_jwt_generator()
+        # Trigger streamer
+        from app.routing.repositories_routes import get_repo_streamer
+        streamer = get_repo_streamer()
+        await streamer.stream_repository(
+            repo_id=source_id,
+            provider=provider,
+            url=uri,
+            branch=branch,
+            access_token=access_token or "",
+            user_id=user_id,
+        )
 
-            if access_token:
-                stored = await credential_storage.store_credential(
-                    repo_id=source_id,
-                    provider=source_type,
-                    user_id=user_id,
-                    access_token=access_token,
-                )
-                if not stored:
-                    logger.error("Failed to store credentials for sync", repo_id=source_id)
-                    await job_manager.update_job_status(job_id, JobStatus.FAILED)
-                    return
-
-            credential_ref = jwt_generator.generate_credential_ref(
-                provider=source_type, repo_id=source_id, user_id=user_id
-            )
-
-            publisher = get_repo_event_publisher()
-            if not publisher:
-                logger.error("Repo event publisher not available", repo_id=source_id)
-                await job_manager.update_job_status(job_id, JobStatus.FAILED)
-                return
-
-            success = publisher.publish_repo_ingest_requested(
-                repo_id=source_id,
-                url=uri,
-                branch=branch,
-                provider=source_type,
-                commit_id="HEAD",
-                credential_ref=credential_ref,
-                user_id=user_id,
-                correlation_id=job_id,
-            )
-
-            if success:
-                logger.info("Published REPO_INGEST_REQUESTED event", repo_id=source_id)
-                # The unified-processor or the consumer will mark it as COMPLETED
-                # But for now, we'll mark it as COMPLETED to indicate we successfully dispatched it
-                await job_manager.update_job_status(job_id, JobStatus.COMPLETED)
-            else:
-                logger.error("Failed to publish REPO_INGEST_REQUESTED event", repo_id=source_id)
-                await job_manager.update_job_status(job_id, JobStatus.FAILED)
+        await job_manager.update_job_status(job_id, JobStatus.COMPLETED)
 
     except Exception as e:
-        logger.error("Failed to process source", job_id=job_id, error=str(e))
+        logger.error("Failed to process repository sync", job_id=job_id, error=str(e))
         await job_manager.update_job_status(job_id, JobStatus.FAILED)
 
 
@@ -1027,9 +847,6 @@ async def get_job(job_id: str):
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
     }
-
-
-
 
 
 # =============================================================================
