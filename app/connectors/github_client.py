@@ -756,6 +756,53 @@ class GitHubConnector(BaseConnector, GitProviderMixin):
             "visibility": "private" if repo.private else "public",
         }
 
+    async def fetch_branches(
+        self,
+        repo_full_name: str,
+        access_token: Optional[str] = None,
+    ) -> tuple[list[str], str, list[str]]:
+        """
+        Fetch branches, default branch, and file extensions for a repository.
+
+        Args:
+            repo_full_name: Full repository name (owner/repo)
+            access_token: Optional OAuth token (overrides current credentials)
+
+        Returns:
+            Tuple of (branch_names, default_branch, file_extensions)
+        """
+        import asyncio
+
+        if access_token:
+            self.set_credentials(access_token)
+
+        def _fetch():
+            repo = self.github.get_repo(repo_full_name)
+
+            # Get branches
+            branches = [b.name for b in repo.get_branches()]
+            default_branch = repo.default_branch
+
+            # Get file extensions from the default branch tree
+            file_extensions = set()
+            try:
+                tree = repo.get_git_tree(default_branch, recursive=True)
+                for item in tree.tree:
+                    if item.type == "blob" and "." in item.path:
+                        ext = "." + item.path.rsplit(".", 1)[-1].lower()
+                        file_extensions.add(ext)
+            except Exception as e:
+                logger.warning(
+                    "Failed to get file extensions from tree",
+                    repo=repo_full_name,
+                    error=str(e),
+                )
+
+            return branches, default_branch, sorted(file_extensions)
+
+        return await asyncio.to_thread(_fetch)
+
+
 
 import re
 
