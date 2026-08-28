@@ -2,5 +2,5 @@
 Infrastructure Module for Data Connector
 ==========================================
 
-Contains database connections, gRPC clients, and event infrastructure.
+Contains database connections, Kafka event infrastructure, and HTTP clients.
 """

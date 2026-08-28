@@ -25,17 +25,12 @@ pip install -e .
 cp .env.map.example .env.map
 cp .env.secret.example .env.secret
 
-# Generate gRPC stubs
-./proto/generate_stubs.sh  # Linux/Mac
-# or ./proto/generate_stubs.ps1  # Windows
-
 # Start the service
 uvicorn app.main:app --host 0.0.0.0 --port 3030
 ```
 
 The service starts at:
 - **HTTP**: `http://localhost:3030`
-- **gRPC**: `localhost:50052`
 
 ## API Endpoints
 
@@ -107,9 +102,7 @@ POST /webhooks/gitlab
 POST /webhooks/generic
 ```
 
-### gRPC removed
 
-Data-connector no longer exposes or depends on gRPC. All hot-path forwarding to the `unified-processor` is done via Kafka events. The repository's gRPC stubs and server components have been removed; developers should use the Kafka-based APIs and the `KAFKA_*` environment variables described above.
 
 ## Ingestion Pipeline
 
@@ -134,7 +127,7 @@ The ingestion process is the core "hot path" of the Data Connector:
 
 5. **Event Creation**: Strictly typed event objects are created
 
-6. **Forwarding**: Events sent to unified-processor via gRPC
+6. **Forwarding**: Events sent to unified-processor via Kafka
 
 ### Classification Logic
 
@@ -144,7 +137,7 @@ The routing logic relies on strictly defined file extensions:
 **Document Files**: Sent to unified-processor for embedding generation
 **Unknown Types**: Skipped to avoid binary pollution
 
-### gRPC Event Payloads
+### Kafka Event Payloads
 
 #### Code Ingested Payload
 ```json
@@ -252,13 +245,13 @@ graph TD
     end
     
     %% Data Connector Layer
-    DC[Data-Connector<br/>Port: 3030<br/>gRPC: 50052]
+    DC[Data-Connector<br/>Port: 3030]
     
     %% Processing Layer
-    UP[Unified-Processor<br/>Port: 8090<br/>gRPC: 50053]
+    UP[Unified-Processor<br/>Port: 8090]
     
     %% Authentication
-    AM[Auth-Middleware<br/>Port: 3010<br/>gRPC: 50058]
+    AM[Auth-Middleware<br/>Port: 3010]
     
     %% Feature Toggle
     FT[Feature-Toggle<br/>Port: 3099]
@@ -273,8 +266,8 @@ graph TD
     GitLab -->|OAuth/API| DC
     OneDrive -->|OAuth/API| DC
     
-    DC -->|gRPC| UP
-    DC -->|gRPC| AM
+    DC -->|Kafka| UP
+    DC -->|HTTP| AM
     DC -->|HTTP| FT
     DC -->|File Operations| Downloads
     
@@ -322,7 +315,7 @@ graph TD
 |------------|---------|---------|
 | **Python** | Runtime | >=3.14 |
 | **FastAPI** | Web Framework | >=0.109.0 |
-| **gRPC** | Service Communication | >=1.60.0 |
+| **Kafka** | Event Streaming | >=2.14.0 |
 | **Pydantic** | Data Validation | >=2.5.0 |
 | **GitPython** | Git Operations | Latest |
 | **httpx** | HTTP Client | >=0.26.0 |
@@ -416,7 +409,7 @@ Use Cases: Docker, Kubernetes, CI/CD, application config
 - **Content Analyzer**: Structure and complexity analysis
 
 #### 3. **Integration Layer**
-- **gRPC Client**: Communication with unified-processor
+- **Kafka Producer**: Event streaming to unified-processor
 - **Event Publisher**: Ingestion event streaming
 - **Storage Manager**: Shared download volume management
 - **Webhook Handler**: External webhook processing
@@ -486,23 +479,6 @@ POST /auth/api-keys
 GET /auth/credentials
 ```
 
-### gRPC Service (Port 50052)
-
-#### Source Operations
-```protobuf
-service DataConnector {
-  rpc CreateSource(CreateSourceRequest) returns (Source);
-  rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
-  rpc GetSource(GetSourceRequest) returns (Source);
-  rpc DeleteSource(DeleteSourceRequest) returns (DeleteSourceResponse);
-  
-  rpc SyncSource(SyncSourceRequest) returns (SyncResponse);
-  rpc GetSyncStatus(GetSyncStatusRequest) returns (SyncStatus);
-  
-  rpc ValidateCredentials(ValidateCredentialsRequest) returns (ValidationResponse);
-}
-```
-
 ## Environment Configuration
 
 ### Required Environment Variables
@@ -514,11 +490,6 @@ PORT=3030
 HOST=0.0.0.0
 DEBUG=false
 ENVIRONMENT=production
-
-# gRPC Service Addresses
-GRPC_PORT=50052
-UNIFIED_PROCESSOR_GRPC_ADDR=localhost:50053
-AUTH_MIDDLEWARE_GRPC_ADDR=auth-middleware:50058
 
 # HTTP Service URLs
 AUTH_SERVICE_URL=https://auth-middleware-fcg0.onrender.com
@@ -583,7 +554,8 @@ sequenceDiagram
     DC->>Storage: Store downloaded files
     DC->>DC: Classify and analyze content
     
-    DC->>UP: gRPC ProcessData request
+    DC->>Kafka: Publish processing events
+    Kafka->>UP: Consume events
     UP-->>DC: Processing acknowledgment
     
     DC->>DC: Update sync status
@@ -597,7 +569,7 @@ sequenceDiagram
 4. **Filtering**: Apply inclusion/exclusion rules
 5. **Download**: Fetch content to shared storage
 6. **Processing**: Classify and analyze content
-7. **Routing**: Send to unified-processor via gRPC
+7. **Routing**: Send to unified-processor via Kafka
 8. **Cleanup**: Remove temporary files
 9. **Status**: Update sync status and metrics
 
@@ -682,38 +654,6 @@ pytest tests/connectors/
 pytest tests/e2e/
 ```
 
-### gRPC Development
-```bash
-# Generate proto stubs
-python -m grpc_tools.protoc \
-  --proto_path=proto/ \
-  --python_out=app/infra/grpc/ \
-  --grpc_python_out=app/infra/grpc/ \
-  proto/*.proto
-
-## Cleanup leftover compiled files
-
-If you see a `generated/` directory with compiled `__pycache__` files after editing generated stubs, remove it with the provided script or run the command below from the repository root:
-
-PowerShell:
-
-```powershell
-.\scripts\clean_generated.ps1
-```
-
-Cross-platform Python one-liner:
-
-```bash
-python - <<'PY'
-import shutil, pathlib
-shutil.rmtree(pathlib.Path('data-connector/app/infra/grpc/generated'), ignore_errors=True)
-PY
-```
-
-# Test gRPC connection
-python -m app.infra.grpc.test_connection
-```
-
 ## Troubleshooting
 
 ### Common Issues
@@ -727,11 +667,6 @@ python -m app.infra.grpc.test_connection
 - Check source credentials are valid
 - Verify network connectivity to source
 - Check rate limiting status
-
-#### "gRPC connection failed"
-- Verify unified-processor is running
-- Check gRPC address configuration
-- Ensure network connectivity
 
 #### "File download failed"
 - Check available disk space

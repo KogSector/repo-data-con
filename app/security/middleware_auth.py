@@ -113,7 +113,7 @@ class AuthMiddleware:
 
     async def get_internal_token(self, api_key: str, user_id: str, provider: str) -> dict:
         """
-        Get auth token for a provider (internal call).
+        Get auth token for a provider (internal HTTP call).
         """
         try:
             resp = await self._client.post(

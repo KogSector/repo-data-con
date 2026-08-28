@@ -1,7 +1,7 @@
 """
 Data Connector Service - Downstream Service Client
 Handles communication with unified-processor via Kafka events.
-Uses gRPC for internal service-to-service communication (auth, health checks).
+Uses HTTP for internal service-to-service communication (auth, health checks).
 """
 
 import structlog

@@ -1,6 +1,6 @@
 # Architecture
 
-The Data Connector operates as a high-throughput gateway that ingests data from external sources and forwards it to the unified-processor via gRPC for downstream processing.
+The Data Connector operates as a high-throughput gateway that ingests data from external sources and forwards it to the unified-processor via Kafka events for downstream processing.
 
 ## High-Level Design
 
@@ -15,7 +15,7 @@ graph TD
     end
 
     subgraph "Data Connector Service"
-        API[API Layer - FastAPI/gRPC]
+        API[API Layer - FastAPI]
         Sync[Sync Engine]
         
         subgraph "Connectors Layer"
@@ -26,7 +26,7 @@ graph TD
         end
         
         Classify[Classifier & Router]
-        GRPC[gRPC Client → unified-processor]
+        KAFKA[Kafka Producer]
     end
 
     subgraph "Downstream"
@@ -44,16 +44,16 @@ graph TD
     GHC --> Classify
     NTC --> Classify
     
-    Classify -->|Code File| GRPC
-    Classify -->|Doc File| GRPC
+    Classify -->|Code File| KAFKA
+    Classify -->|Doc File| KAFKA
     
-    GRPC -->|gRPC| UP
+    KAFKA -->|Kafka Events| UP
 ```
 
 ## Component Breakdown
 
 ### 1. API Layer
-- **gRPC**: Handles administrative tasks like adding a new source, listing jobs, and manual sync triggers.
+- **HTTP**: Handles all administrative tasks like adding a new source, listing jobs, and manual sync triggers.
 - **HTTP**: Receives OAuth callbacks and incoming webhooks from providers like GitHub.
 
 ### 2. Connector Layer
@@ -70,31 +70,14 @@ graph TD
 
 ### 4. Classifier & Router
 - **Extension Logic**: strictly maps file extensions to types (e.g., `.py` -> Code, `.md` -> Doc).
-- **Routing**: Classifies files by type (Code vs Docs) and forwards them to unified-processor via gRPC.
+- **Routing**: Classifies files by type (Code vs Docs) and forwards them to unified-processor via Kafka events.
 
-### 5. gRPC Client (unified-processor)
-- **Connection Management**: Establishes async gRPC channel to unified-processor service
-- **Health Checking**: Validates connectivity on startup with health check RPC
-- **Proto Stubs**: Uses generated protobuf stubs from `proto/unified_processor.proto`
+### 5. Kafka Event Producer
+- **Connection Management**: Establishes async connection to Kafka cluster
+- **Health Checking**: Validates connectivity on startup with Kafka health check
+- **Event Publishing**: Publishes structured events to Kafka topics for downstream processing
 - **Error Handling**: Graceful handling of connection failures with detailed logging
-- **Status Handling**: Uses gRPC status codes for rich error information
-- **Reflection Support**: Enables gRPC server reflection for debugging and tooling
-- **Configuration**: Uses `unified_processor_url` from settings for service address
-
-**gRPC Dependencies** (v1.60.0+):
-- `grpcio`: Core gRPC runtime for Python
-- `grpcio-tools`: Protocol buffer compiler and code generator
-- `grpcio-status`: Rich status code support for detailed error handling
-- `grpcio-reflection`: Server reflection for service discovery and debugging
-
-**Prerequisites**: Proto stubs must be generated before running:
-```bash
-# Windows
-./proto/generate_stubs.ps1
-
-# Linux/Mac
-./proto/generate_stubs.sh
-```
+- **Configuration**: Uses Kafka settings from environment variables for bootstrap servers and security
 
 ### 6. Data Flow
 
@@ -104,7 +87,7 @@ graph TD
 3. **Filter**: Ignores binary/large files based on config.
 4. **Download**: Content is downloaded into memory.
 5. **Classify**: File type is determined.
-6. **Forward**: Data is sent to unified-processor via gRPC with content and metadata.
+6. **Forward**: Data is sent to unified-processor via Kafka events with content and metadata.
 
 #### Document Upload Flow
 1. **Upload**: User uploads documents via `/api/v1/documents/upload` endpoint
@@ -113,7 +96,7 @@ graph TD
 4. **Processing**: Each file is immediately processed:
    - File content is read into memory
    - File type is determined from extension
-   - File is forwarded to unified-processor via gRPC
+   - File is forwarded to unified-processor via Kafka events
 5. **Response**: Returns summary with processed and failed files
 
 **Supported Document Types:**
