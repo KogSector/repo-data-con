@@ -636,6 +636,7 @@ class GitLabConnector(BaseConnector):
         ]
         all_exclude_patterns = list(exclude_patterns) + default_excluded
 
+        files_to_download = []
         for item in tree:
             if item["type"] != "blob":
                 continue
